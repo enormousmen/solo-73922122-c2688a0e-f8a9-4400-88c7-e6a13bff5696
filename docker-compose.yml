@@ -9,6 +9,11 @@ services:
       - origin-data:/data/packages
     ports:
       - "8081:8000"   # origin control API: /control/*, /docs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   proxy:
     build: ./proxy
@@ -20,7 +25,13 @@ services:
     ports:
       - "8080:8000"          # download API + /docs purge entry
     depends_on:
-      - origin
+      origin:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   origin-data:

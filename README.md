@@ -24,9 +24,12 @@ curl -X POST http://localhost:8080/purge/pkg-32m.bin
 
 # 查看代理内部状态
 curl http://localhost:8080/cache/status
+
+# 查看回源熔断状态（state / 冷却剩余 / 探测键 / 在途填充数）
+curl http://localhost:8080/origin/status
 ```
 
-源站控制（换内容 / 延迟 / 断流 / 回源次数）：
+源站控制（换内容 / 延迟 / 断流 / 5xx / 回源次数）：
 
 ```bash
 # 查看回源次数与当前包 sha256
@@ -45,6 +48,14 @@ curl -X POST http://localhost:8081/control/behavior \
   -H 'Content-Type: application/json' \
   -d '{"chunk_delay_ms":0,"truncate_after_bytes":200000,"chunk_size":65536}'
 
+# 所有包请求直接返回 503（模拟源站 5xx 故障）
+curl -X POST http://localhost:8081/control/behavior \
+  -H 'Content-Type: application/json' -d '{"fail_status":503}'
+
+# 恢复源站（fail_status 置 null）
+curl -X POST http://localhost:8081/control/behavior \
+  -H 'Content-Type: application/json' -d '{"fail_status":null}'
+
 # 清零回源计数
 curl -X POST http://localhost:8081/control/reset
 ```
@@ -59,9 +70,18 @@ curl -X POST http://localhost:8081/control/reset
   已开始的旧下载继续读完旧代文件；旧填充完成也不会重新登记；
   旧文件在最后一个读者结束后回收。
 * **失败传播**：上游断流/非 200 使该代所有下载失败（客户端读到不完整
-  响应），半包立即删除、绝不入缓存；下一个请求自动重试回源。
+  响应），半包立即删除、绝不入缓存；下一个请求自动重试回源（受下述熔断约束）。
+* **回源故障隔离**：连续 2 次因连接失败、源站 5xx 或传输中断导致填充失败后，
+  代理打开熔断并冷却 5 秒。冷却期内，没有任何在途填充可加入的未命中请求
+  立即返回 `503`（带 `Retry-After`），不会打到源站；完整缓存命中照常服务，
+  已开始的填充及其同路径读者不受影响、正常读完。冷却期满后只放行一个未命中
+  请求作为探测：探测在途时，其他新填充（含其他路径）返回 `503`，探测自身
+  路径的新请求仍加入同一填充。完整填充成功、或源站返回 404（不缓存，视为
+  源站可用）即恢复正常；探测失败则重新进入 5 秒冷却。失败判定只针对源站
+  原因（`ClientConnectionError` / `ClientPayloadError` / 读超时 / 5xx），
+  本地磁盘错误不计入；熔断状态见 `GET /origin/status`。
 * **重启**：`proxy-cache` 卷保留完整包；启动时清理 `.part-*` 残件与孤儿
-  meta。404 不做负缓存。
+  meta。404 不做负缓存。熔断状态仅在进程内，重启后为关闭状态。
 
 ## 本地自测（无 Docker 时）
 
@@ -73,5 +93,8 @@ python3 -m pytest tests/ -v
 
 测试以真实子进程启动源站与代理，覆盖：单飞、首块延迟、慢客户端隔离、
 清除语义（含填充中清除）、断流不缓存半包、重启保留/清理、内存有界、
-404 与路径穿越。`tests/run_server.py` 是测试专用启动器（本沙箱禁止
-进程间信号，用控制文件代替 SIGTERM 停服），交付应用本身不含测试钩子。
+404 与路径穿越，以及回源熔断：连续 5xx / 连接拒绝 / 传输中断开路、冷却期
+`503` 且零回源、冷却期满单探测、探测在途阻断其他新填充、探测失败重新冷却、
+完整填充或 404 恢复、成功清零连续计数、开路期间缓存命中与在途填充不受影响。
+`tests/run_server.py` 是测试专用启动器（本沙箱禁止进程间信号，用控制文件代替
+SIGTERM 停服），交付应用本身不含测试钩子。

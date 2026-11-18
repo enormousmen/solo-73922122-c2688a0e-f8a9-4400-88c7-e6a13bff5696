@@ -101,13 +101,20 @@ def origin_stats(origin_url: str) -> dict:
         return c.get(f"{origin_url}/control/stats").json()
 
 
+def breaker_status(proxy_url: str) -> dict:
+    with client() as c:
+        r = c.get(f"{proxy_url}/origin/status")
+        r.raise_for_status()
+        return r.json()
+
+
 def origin_reset(origin_url: str) -> None:
     with client() as c:
         c.post(f"{origin_url}/control/reset")
 
 
 def set_behavior(origin_url: str, delay_ms: int = 0, truncate: int | None = None,
-                 chunk_size: int = 256 * 1024) -> None:
+                 chunk_size: int = 256 * 1024, fail_status: int | None = None) -> None:
     with client() as c:
         r = c.post(
             f"{origin_url}/control/behavior",
@@ -115,6 +122,7 @@ def set_behavior(origin_url: str, delay_ms: int = 0, truncate: int | None = None
                 "chunk_delay_ms": delay_ms,
                 "truncate_after_bytes": truncate,
                 "chunk_size": chunk_size,
+                "fail_status": fail_status,
             },
         )
         r.raise_for_status()
@@ -176,6 +184,16 @@ class ProxyRunner:
 @pytest.fixture()
 def proxy(origin, tmp_path):
     runner = ProxyRunner(origin.port, tmp_path / "cache", tmp_path / "proxy.log",
+                         tmp_path / "proxy.stop")
+    runner.start()
+    yield runner
+    runner.stop()
+
+
+@pytest.fixture()
+def dead_proxy(tmp_path):
+    """A proxy whose origin address has no listener (connection refused)."""
+    runner = ProxyRunner(free_port(), tmp_path / "cache", tmp_path / "proxy.log",
                          tmp_path / "proxy.stop")
     runner.start()
     yield runner
@@ -400,3 +418,258 @@ def test_path_traversal_rejected(proxy):
     with client() as c:
         r = c.get(f"{proxy.url}/packages/..%2f..%2fetc%2fpasswd")
     assert r.status_code in (400, 404)
+
+
+# --------------------------------------------------------------------- #
+# origin circuit breaker                                                  #
+# --------------------------------------------------------------------- #
+
+def test_breaker_opens_after_two_5xx_and_short_circuits_misses(proxy, origin):
+    set_behavior(origin.url, fail_status=503)
+    origin_reset(origin.url)
+    try:
+        with client() as c:
+            r1 = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            r2 = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert r1.status_code == 503 and r2.status_code == 503
+            assert origin_stats(origin.url)["total_hits"] == 2
+            st = breaker_status(proxy.url)
+            assert st["state"] == "open"
+            assert st["consecutive_failures"] == 2
+
+            # During cooldown a new miss is refused without touching origin.
+            r3 = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert r3.status_code == 503
+            assert int(r3.headers["Retry-After"]) >= 1
+            assert origin_stats(origin.url)["total_hits"] == 2
+    finally:
+        set_behavior(origin.url)
+
+
+def test_breaker_half_open_single_probe_then_recovers(proxy, origin):
+    set_behavior(origin.url, fail_status=500)
+    origin_reset(origin.url)
+    try:
+        with client() as c:
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert breaker_status(proxy.url)["state"] == "open"
+    finally:
+        set_behavior(origin.url)  # origin healthy again
+
+    time.sleep(5.2)  # let the 5 s cooldown elapse
+
+    # Origin healthy: the first miss after cooldown is the probe and succeeds.
+    body = download_bytes(proxy.url, PKG_SMALL)
+    assert len(body) == MIB
+    st = breaker_status(proxy.url)
+    assert st["state"] == "closed" and st["consecutive_failures"] == 0
+    assert origin_stats(origin.url)["paths"][PKG_SMALL] == 3  # 2 fails + probe
+    assert download_bytes(proxy.url, PKG_SMALL) == body  # served from cache
+
+
+def test_breaker_half_open_probe_blocks_other_fills(proxy, origin):
+    # Two failures on one path open the breaker; reset counters afterwards so
+    # the assertion below counts only the probe phase.
+    set_behavior(origin.url, fail_status=502)
+    try:
+        with client() as c:
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert breaker_status(proxy.url)["state"] == "open"
+    finally:
+        set_behavior(origin.url)
+    origin_reset(origin.url)
+
+    time.sleep(5.2)
+
+    # Make the probe slow so it is still in flight when we race other paths.
+    set_behavior(origin.url, delay_ms=50, chunk_size=64 * 1024)  # ~0.8s fill
+    try:
+        result: dict = {}
+
+        def probe():
+            result["body"] = download_bytes(proxy.url, PKG_SMALL)
+
+        t = threading.Thread(target=probe)
+        t.start()
+        time.sleep(0.3)  # probe has started, still filling
+        with client() as c:
+            # A different uncached path must be refused while probing.
+            r_other = c.get(f"{proxy.url}/packages/{PKG_BIG}")
+            # The probe's own path joins the running fill normally.
+            r_same = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+        assert r_other.status_code == 503
+        assert "x-cache" not in r_other.headers  # refused, not served
+        t.join(30)
+        assert r_same.status_code == 200 and len(r_same.content) == MIB
+        assert sha256(result["body"]) == sha256(r_same.content)
+        assert breaker_status(proxy.url)["state"] == "closed"
+        # other path never fetched; shared probe path fetched exactly once more
+        stats = origin_stats(origin.url)
+        assert PKG_BIG not in stats["paths"]
+        assert stats["paths"][PKG_SMALL] == 1
+    finally:
+        set_behavior(origin.url)
+
+
+def test_breaker_failed_probe_reopens_cooldown(proxy, origin):
+    set_behavior(origin.url, fail_status=503)
+    try:
+        with client() as c:
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+        time.sleep(5.2)
+        # Still failing: the probe itself fails and the breaker re-opens.
+        with client() as c:
+            r = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert r.status_code == 503
+            st = breaker_status(proxy.url)
+            assert st["state"] == "open"
+            assert st["retry_after_s"] > 4.0
+            hits = origin_stats(origin.url)["total_hits"]
+            # Immediately after the failed probe, misses are refused again.
+            r2 = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert r2.status_code == 503
+            assert origin_stats(origin.url)["total_hits"] == hits
+    finally:
+        set_behavior(origin.url)
+
+
+def test_breaker_keeps_serving_complete_cache_and_running_fills(proxy, origin):
+    # Warm the cache for the big package, then take the origin down.
+    body = download_bytes(proxy.url, PKG_BIG)
+    assert len(body) == 32 * MIB
+    set_behavior(origin.url, fail_status=503)
+    origin_reset(origin.url)
+    try:
+        with client() as c:
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert breaker_status(proxy.url)["state"] == "open"
+            assert origin_stats(origin.url)["total_hits"] == 2
+            # Cached complete object is still a normal HIT.
+            r = c.get(f"{proxy.url}/packages/{PKG_BIG}")
+            assert r.status_code == 200 and r.headers["x-cache"] == "HIT"
+            assert sha256(r.content) == sha256(body)
+            assert origin_stats(origin.url)["total_hits"] == 2
+    finally:
+        set_behavior(origin.url)
+
+
+def test_breaker_404_counts_as_origin_available(proxy, origin):
+    set_behavior(origin.url, fail_status=503)
+    try:
+        with client() as c:
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert breaker_status(proxy.url)["state"] == "open"
+    finally:
+        set_behavior(origin.url)
+
+    time.sleep(5.2)
+    # The probe hits a path the origin does not have: 404, origin is reachable.
+    with client() as c:
+        r = c.get(f"{proxy.url}/packages/nope-probe.bin")
+        assert r.status_code == 404
+        st = breaker_status(proxy.url)
+        assert st["state"] == "closed"
+        # Normal operation resumed: a real package fills again.
+        assert len(c.get(f"{proxy.url}/packages/{PKG_SMALL}").content) == MIB
+        # 404 was not cached as an object.
+        assert PKG_SMALL in c.get(f"{proxy.url}/cache/status").json()
+        assert "nope-probe.bin" not in c.get(f"{proxy.url}/cache/status").json()
+
+
+def test_breaker_opens_on_connection_refused(dead_proxy):
+    with client() as c:
+        r1 = c.get(f"{dead_proxy.url}/packages/{PKG_SMALL}")
+        r2 = c.get(f"{dead_proxy.url}/packages/{PKG_SMALL}")
+        assert r1.status_code == 502 and r2.status_code == 502
+        st = breaker_status(dead_proxy.url)
+        assert st["state"] == "open"
+        # Third request is refused locally with 503, no origin attempt possible.
+        r3 = c.get(f"{dead_proxy.url}/packages/{PKG_SMALL}")
+        assert r3.status_code == 503
+        assert int(r3.headers["Retry-After"]) >= 1
+
+
+def test_breaker_opens_on_transfer_interruption(proxy, origin):
+    set_behavior(origin.url, delay_ms=5, chunk_size=64 * 1024, truncate=100_000)
+    origin_reset(origin.url)
+    try:
+        with client() as c:
+            with pytest.raises(httpx.HTTPError):
+                c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            with pytest.raises(httpx.HTTPError):
+                c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert breaker_status(proxy.url)["state"] == "open"
+            assert origin_stats(origin.url)["total_hits"] == 2
+            r = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert r.status_code == 503
+            assert origin_stats(origin.url)["total_hits"] == 2
+    finally:
+        set_behavior(origin.url)
+
+
+def test_breaker_counts_only_consecutive_failures(proxy, origin):
+    # One failure, then a success, then one failure: must not open.
+    set_behavior(origin.url, fail_status=503)
+    try:
+        with client() as c:
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+    finally:
+        set_behavior(origin.url)
+    assert len(download_bytes(proxy.url, PKG_SMALL)) == MIB  # success resets
+    set_behavior(origin.url, fail_status=503)
+    try:
+        with client() as c:
+            with client() as c2:
+                c2.post(f"{proxy.url}/purge/{PKG_SMALL}")
+            c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert breaker_status(proxy.url)["state"] != "open"
+    finally:
+        set_behavior(origin.url)
+
+
+def test_breaker_open_does_not_disturb_inflight_fill_or_its_readers(proxy, origin):
+    # Start a slow fill on the big package first (~2.6s at 20ms/chunk).
+    set_behavior(origin.url, delay_ms=20, chunk_size=256 * 1024)
+    origin_reset(origin.url)
+    result: dict = {}
+    try:
+        def slow_reader():
+            with client(timeout_read=120).stream(
+                "GET", f"{proxy.url}/packages/{PKG_BIG}"
+            ) as r:
+                got = 0
+                for chunk in r.iter_bytes(256 * 1024):
+                    got += len(chunk)
+                    if got >= 4 * 256 * 1024:
+                        time.sleep(0.3)  # still reading when breaker opens
+                result["got"] = got
+
+        t = threading.Thread(target=slow_reader)
+        t.start()
+        time.sleep(0.5)  # fill is in flight
+
+        # Two 5xx on a different path open the breaker while the fill runs.
+        set_behavior(origin.url, fail_status=503)
+        with client() as c:
+            assert c.get(f"{proxy.url}/packages/{PKG_SMALL}").status_code == 503
+            assert c.get(f"{proxy.url}/packages/{PKG_SMALL}").status_code == 503
+            assert breaker_status(proxy.url)["state"] == "open"
+            # A third miss with no in-flight fill is refused locally.
+            assert c.get(f"{proxy.url}/packages/{PKG_SMALL}").status_code == 503
+            # A miss that can join the already-running fill still joins it.
+            joined = c.get(f"{proxy.url}/packages/{PKG_BIG}", timeout=120)
+            assert joined.status_code == 200 and len(joined.content) == 32 * MIB
+
+        t.join(60)
+        assert result.get("got") == 32 * MIB  # reader finished unaffected
+        # The in-flight fill completed successfully and restored normal service.
+        st = breaker_status(proxy.url)
+        assert st["state"] == "closed"
+        assert len(download_bytes(proxy.url, PKG_BIG)) == 32 * MIB
+    finally:
+        set_behavior(origin.url)

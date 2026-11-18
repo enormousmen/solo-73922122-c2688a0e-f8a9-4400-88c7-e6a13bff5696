@@ -30,6 +30,7 @@ behavior = {
     "chunk_delay_ms": 0,
     "truncate_after_bytes": None,  # int | None
     "chunk_size": 256 * 1024,
+    "fail_status": None,  # int | None: answer package GETs with this status
 }
 hits = {"total": 0, "paths": {}}
 digests: dict[str, str] = {}
@@ -106,12 +107,18 @@ async def get_package(path: str):
     hits["total"] += 1
     hits["paths"][key] = hits["paths"].get(key, 0) + 1
 
+    beh = dict(behavior)  # snapshot for this request
+    if beh["fail_status"] is not None:
+        # Simulated outage: every package GET fails, existing or not.
+        return PlainTextResponse(
+            "simulated origin failure", status_code=int(beh["fail_status"])
+        )
+
     p = PKG_DIR / key
     if not p.is_file():
         return PlainTextResponse("package not found", status_code=404)
 
     size = p.stat().st_size
-    beh = dict(behavior)  # snapshot for this request
 
     async def body():
         sent = 0
@@ -149,6 +156,12 @@ class Behavior(BaseModel):
         None, ge=0, description="abort the stream after this many bytes"
     )
     chunk_size: int = Field(256 * 1024, ge=1, description="origin stream chunk size")
+    fail_status: int | None = Field(
+        None,
+        ge=400,
+        le=599,
+        description="answer package GETs with this status (simulate outage)",
+    )
 
 
 @app.post("/control/behavior")
